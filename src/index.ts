@@ -8,10 +8,16 @@ const app = express();
 const port = process.env.PORT || 8742;
 const authToken = process.env.authToken || null;
 
-// Vercel এর জন্য ব্রাউজার লঞ্চার ফাংশন
-async function getBrowserInstance() {
+// ক্যাশ এবং গ্লোবাল লিমিট Vercel-এ সাময়িকভাবে কাজ করবে (প্রতি ইনভোকেশনে রিসেট হবে)
+(global as any).browserLimit = Number(process.env.browserLimit) || 20;
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Vercel-এর জন্য ব্রাউজার লঞ্চার ফাংশন
+async function getBrowser() {
     return await puppeteer.launch({
-        args: chromium.args,
+        args: [...chromium.args, "--no-sandbox", "--disable-setuid-sandbox"],
         defaultViewport: chromium.defaultViewport,
         executablePath: await chromium.executablePath(),
         headless: chromium.headless,
@@ -19,16 +25,13 @@ async function getBrowserInstance() {
     });
 }
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// Cloudflare Endpoint
 app.post('/cloudflare', async (req: Request, res: Response): Promise<any> => {
     const startTime = Date.now();
     const data = req.body;
     let browser = null;
     let page = null;
 
+    // ভ্যালিডেশন
     if (!data || typeof data.mode !== 'string') {
         return res.status(400).json({ message: 'Bad Request: missing or invalid mode' });
     }
@@ -37,11 +40,11 @@ app.post('/cloudflare', async (req: Request, res: Response): Promise<any> => {
     }
 
     try {
-        // ব্রাউজার এবং পেজ সেটআপ
-        browser = await getBrowserInstance();
+        // ব্রাউজার ওপেন করা
+        browser = await getBrowser();
         page = await browser.newPage();
 
-        // রিসোর্স ব্লকিং (স্পিড বাড়ানোর জন্য)
+        // স্পিড বাড়ানোর জন্য ইমেজ/মিডিয়া ব্লক
         await page.setRequestInterception(true);
         page.on('request', (req: any) => {
             if (["image", "stylesheet", "font", "media"].includes(req.resourceType())) {
@@ -52,8 +55,6 @@ app.post('/cloudflare', async (req: Request, res: Response): Promise<any> => {
         });
 
         let result: any;
-        const targetDomain = data.domain || data.url;
-
         switch (data.mode) {
             case "turnstile":
                 result = await turnstile(data as any, page)
@@ -62,8 +63,10 @@ app.post('/cloudflare', async (req: Request, res: Response): Promise<any> => {
                 break;
 
             case "iuam":
-                // IUAM মোডে ডোমেইন ভিজিট করা
-                await page.goto(targetDomain, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                // IUAM এর জন্য ডোমেইন ভিজিট করা জরুরি
+                if (data.domain) {
+                    await page.goto(data.domain, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                }
                 result = await iuam(data as any, page)
                     .then(r => ({ code: 200, ...r }))
                     .catch(err => ({ code: 500, message: err.message }));
@@ -79,7 +82,7 @@ app.post('/cloudflare', async (req: Request, res: Response): Promise<any> => {
     } catch (err: any) {
         return res.status(500).json({ code: 500, message: err.message });
     } finally {
-        // Vercel-এ ব্রাউজার ক্লোজ করা বাধ্যতামূলক নতুবা মেমোরি লিক হবে
+        // ব্রাউজার ক্লোজ করা বাধ্যতামূলক নতুবা Vercel 504 Error দেবে
         if (page) await page.close().catch(() => {});
         if (browser) await browser.close().catch(() => {});
     }
@@ -89,9 +92,4 @@ app.use((req: Request, res: Response) => {
     res.status(404).json({ message: 'Not Found' });
 });
 
-// Vercel এর জন্য এক্সপোর্ট
 export default app;
-
-if (process.env.NODE_ENV === 'development') {
-    app.listen(port, () => console.log(`Dev server on ${port}`));
-}
