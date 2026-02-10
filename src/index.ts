@@ -1,110 +1,34 @@
 import express, { Request, Response } from 'express';
+import chromium from '@sparticuz/chromium';
+import puppeteer from 'puppeteer-core';
 import turnstile from './lib/ends/turnstile';
 import iuam from './lib/ends/iuam';
-import { connect } from "./lib/browser/br";
 
 const app = express();
 const port = process.env.PORT || 8742;
 const authToken = process.env.authToken || null;
 
-(global as any).browserLimit = Number(process.env.browserLimit) || 20;
-(global as any).timeOut = Number(process.env.timeOut) || 60000;
-
-const CACHE_TTL = 30 * 60 * 1000;
-
-interface CacheEntry {
-    expireAt: number;
-    value: any;
-}
-
-interface Cache {
-    [key: string]: CacheEntry;
-}
-
-const memoryCache: Cache = {};
-
-async function readCache(key: string): Promise<any> {
-    const entry = memoryCache[key];
-    if (entry && Date.now() < entry.expireAt) {
-        return entry.value;
-    }
-    return null;
-}
-
-async function writeCache(key: string, value: any, ttl: number = CACHE_TTL) {
-    memoryCache[key] = { expireAt: Date.now() + ttl, value };
+// Vercel এর জন্য ব্রাউজার লঞ্চার ফাংশন
+async function getBrowserInstance() {
+    return await puppeteer.launch({
+        args: chromium.args,
+        defaultViewport: chromium.defaultViewport,
+        executablePath: await chromium.executablePath(),
+        headless: chromium.headless,
+        ignoreHTTPSErrors: true,
+    });
 }
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-if (process.env.NODE_ENV !== 'development') {
-    let server = app.listen(port, async () => {
-        console.log(`Server running on port ${port}`);
-    });
-    try {
-        server.timeout = (global as any).timeOut;
-    } catch { }
-}
-
-let browser: any = null;
-
-async function initBrowser() {
-    if (browser) return browser;
-
-    try {
-        const { browser: connectedBrowser } = await connect({
-            headless: false,
-            turnstile: true,
-            connectOption: { defaultViewport: null },
-            disableXvfb: false,
-        });
-
-        browser = connectedBrowser;
-
-        browser.on('disconnected', () => {
-            console.log('Browser disconnected');
-            browser = null;
-        });
-
-        return browser;
-    } catch (error) {
-        console.error('Failed to initialize browser:', error);
-        throw error;
-    }
-}
-
-initBrowser().then(() => console.log("Browser initialized")).catch(err => console.error("Initial browser launch failed", err));
-
-
-async function getPage() {
-    if (!browser || !browser.isConnected()) {
-        await initBrowser();
-    }
-
-    if (!browser) {
-        throw new Error("Browser not available");
-    }
-
-    const page = await browser.newPage();
-
-    await page.goto('about:blank');
-    await page.setRequestInterception(true);
-    page.on('request', async (req: any) => {
-        const type = req.resourceType();
-        if (["image", "stylesheet", "font", "media"].includes(type)) {
-            await req.abort();
-        } else {
-            await req.continue();
-        }
-    });
-
-    return page;
-}
-
+// Cloudflare Endpoint
 app.post('/cloudflare', async (req: Request, res: Response): Promise<any> => {
     const startTime = Date.now();
     const data = req.body;
+    let browser = null;
+    let page = null;
+
     if (!data || typeof data.mode !== 'string') {
         return res.status(400).json({ message: 'Bad Request: missing or invalid mode' });
     }
@@ -112,64 +36,62 @@ app.post('/cloudflare', async (req: Request, res: Response): Promise<any> => {
         return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    if ((global as any).browserLimit <= 0) {
-        return res.status(429).json({ message: 'Too Many Requests' });
-    }
-
-    let cacheKey: string = "", cached;
-    if (data.mode === "iuam") {
-        cacheKey = JSON.stringify(data);
-        cached = await readCache(cacheKey);
-        if (cached) {
-            return res.status(200).json({ ...cached, cached: true, elapsed: ((Date.now() - startTime) / 1000).toFixed(2) + 's' });
-        }
-    }
-
-    (global as any).browserLimit--;
-    let result: any;
-    let page;
-
     try {
-        page = await getPage();
+        // ব্রাউজার এবং পেজ সেটআপ
+        browser = await getBrowserInstance();
+        page = await browser.newPage();
+
+        // রিসোর্স ব্লকিং (স্পিড বাড়ানোর জন্য)
+        await page.setRequestInterception(true);
+        page.on('request', (req: any) => {
+            if (["image", "stylesheet", "font", "media"].includes(req.resourceType())) {
+                req.abort();
+            } else {
+                req.continue();
+            }
+        });
+
+        let result: any;
+        const targetDomain = data.domain || data.url;
 
         switch (data.mode) {
             case "turnstile":
                 result = await turnstile(data as any, page)
-                    .then(token => ({ token }))
+                    .then(token => ({ code: 200, token }))
                     .catch(err => ({ code: 500, message: err.message }));
                 break;
 
             case "iuam":
+                // IUAM মোডে ডোমেইন ভিজিট করা
+                await page.goto(targetDomain, { waitUntil: 'domcontentloaded', timeout: 30000 });
                 result = await iuam(data as any, page)
-                    .then(r => ({ ...r }))
+                    .then(r => ({ code: 200, ...r }))
                     .catch(err => ({ code: 500, message: err.message }));
-
-                if (!result.code || result.code === 200) {
-                    const ttl = Number(data.ttl || data.expire) || CACHE_TTL;
-                    await writeCache(cacheKey, result, ttl);
-                }
                 break;
 
             default:
                 result = { code: 400, message: 'Invalid mode' };
         }
-    } catch (err: any) {
-        result = { code: 500, message: err.message };
-    } finally {
-        if (page) {
-            try { await page.close(); } catch { }
-        }
-        (global as any).browserLimit++;
-    }
 
-    if (!result.elapsed) {
         result.elapsed = ((Date.now() - startTime) / 1000).toFixed(2) + 's';
+        return res.status(result.code || 200).json(result);
+
+    } catch (err: any) {
+        return res.status(500).json({ code: 500, message: err.message });
+    } finally {
+        // Vercel-এ ব্রাউজার ক্লোজ করা বাধ্যতামূলক নতুবা মেমোরি লিক হবে
+        if (page) await page.close().catch(() => {});
+        if (browser) await browser.close().catch(() => {});
     }
-    res.status(result.code ?? 200).json(result);
 });
 
-app.use(async (req: Request, res: Response) => {
+app.use((req: Request, res: Response) => {
     res.status(404).json({ message: 'Not Found' });
 });
 
+// Vercel এর জন্য এক্সপোর্ট
 export default app;
+
+if (process.env.NODE_ENV === 'development') {
+    app.listen(port, () => console.log(`Dev server on ${port}`));
+}
